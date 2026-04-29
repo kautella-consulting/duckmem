@@ -4,15 +4,19 @@ from unittest.mock import MagicMock, patch
 
 import duckdb
 import pytest
+from cryptography.fernet import Fernet, InvalidToken
 
 from duckmem.core import (
+    LOCK_MAGIC,
     DuckMem,
+    _derive_legacy_key,
     add_item,
     add_relation,
     get_entity_history,
     get_entity_state,
     get_item,
     list_items,
+    lock,
     session_end,
     session_list,
     session_log_event,
@@ -20,6 +24,7 @@ from duckmem.core import (
     session_start,
     stats,
     traverse_graph,
+    unlock,
     verify,
 )
 from duckmem.ingestion.chunkers import ChunkConfig
@@ -172,7 +177,7 @@ class TestSessions:
         """Test logging events to session."""
         session_id = session_start(db_conn, "Log Test")
 
-        event_id = session_log_event(
+        session_log_event(
             db_conn,
             session_id,
             "add",
@@ -221,6 +226,59 @@ class TestMaintenance:
         assert result.items == 1
         assert result.relations == 1
         assert result.entities == 2
+
+
+class TestEncryption:
+    """Tests for database file encryption."""
+
+    def test_lock_uses_salted_kdf_format_and_unlocks(self, tmp_path):
+        """Test lock writes the salted format and unlock restores bytes."""
+        src = tmp_path / "source.duckdb"
+        encrypted = tmp_path / "locked.duckmem"
+        decrypted = tmp_path / "restored.duckdb"
+        src.write_bytes(b"test database bytes")
+
+        lock(str(src), str(encrypted), "correct horse battery staple")
+
+        payload = encrypted.read_bytes()
+        assert payload.startswith(LOCK_MAGIC)
+        assert b"test database bytes" not in payload
+
+        unlock(str(encrypted), str(decrypted), "correct horse battery staple")
+
+        assert decrypted.read_bytes() == b"test database bytes"
+
+    def test_unlock_rejects_wrong_password(self, tmp_path):
+        """Test wrong passwords do not decrypt locked files."""
+        src = tmp_path / "source.duckdb"
+        encrypted = tmp_path / "locked.duckmem"
+        decrypted = tmp_path / "restored.duckdb"
+        src.write_bytes(b"test database bytes")
+
+        lock(str(src), str(encrypted), "right-password")
+
+        with pytest.raises(InvalidToken):
+            unlock(str(encrypted), str(decrypted), "wrong-password")
+
+    def test_unlock_reads_legacy_sha256_format(self, tmp_path):
+        """Test files encrypted before salted PBKDF2 remain decryptable."""
+        encrypted = tmp_path / "legacy.duckmem"
+        decrypted = tmp_path / "restored.duckdb"
+        key = _derive_legacy_key("legacy-password")
+        encrypted.write_bytes(Fernet(key).encrypt(b"legacy database bytes"))
+
+        unlock(str(encrypted), str(decrypted), "legacy-password")
+
+        assert decrypted.read_bytes() == b"legacy database bytes"
+
+    def test_unlock_rejects_malformed_salted_format(self, tmp_path):
+        """Test malformed salted-format files fail closed."""
+        encrypted = tmp_path / "malformed.duckmem"
+        decrypted = tmp_path / "restored.duckdb"
+        encrypted.write_bytes(LOCK_MAGIC + b"short")
+
+        with pytest.raises(InvalidToken):
+            unlock(str(encrypted), str(decrypted), "password")
 
 
 class TestDuckMemClass:
