@@ -7,6 +7,7 @@ standalone functions for functional programming style usage.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -16,7 +17,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import duckdb
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from duckmem.config import Settings, get_settings
 from duckmem.inference import embed, embed_single
@@ -50,6 +53,10 @@ if TYPE_CHECKING:
 
 
 SearchMode = Literal["hybrid", "lexical", "semantic"]
+
+LOCK_MAGIC = b"DUCKMEMLOCK\x01"
+LOCK_SALT_BYTES = 16
+LOCK_KDF_ITERATIONS = 600_000
 
 
 # =============================================================================
@@ -156,10 +163,8 @@ def add_item(
         )
 
     # Rebuild FTS index
-    try:
+    with contextlib.suppress(duckdb.Error):
         init_fts_index(conn)
-    except duckdb.Error:
-        pass  # FTS might not be available
 
     return item_id
 
@@ -998,8 +1003,19 @@ def stats(conn: duckdb.DuckDBPyConnection, db_path: str | None = None) -> Stats:
 # =============================================================================
 
 
-def _derive_key(password: str) -> bytes:
-    """Derive Fernet key from password using SHA-256."""
+def _derive_key(password: str, salt: bytes, iterations: int = LOCK_KDF_ITERATIONS) -> bytes:
+    """Derive a Fernet key from a password using PBKDF2-HMAC-SHA256."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=iterations,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+
+def _derive_legacy_key(password: str) -> bytes:
+    """Derive keys for databases encrypted before salted PBKDF2 was added."""
     hash_bytes = hashlib.sha256(password.encode()).digest()
     return base64.urlsafe_b64encode(hash_bytes)
 
@@ -1018,16 +1034,23 @@ def lock(src_path: str, dst_path: str, password: str) -> None:
     if not os.path.exists(src_path):
         raise FileNotFoundError(f"Source file not found: {src_path}")
 
-    key = _derive_key(password)
+    salt = os.urandom(LOCK_SALT_BYTES)
+    key = _derive_key(password, salt)
     fernet = Fernet(key)
 
     with open(src_path, "rb") as f:
         data = f.read()
 
     encrypted = fernet.encrypt(data)
+    payload = (
+        LOCK_MAGIC
+        + LOCK_KDF_ITERATIONS.to_bytes(4, "big")
+        + salt
+        + encrypted
+    )
 
     with open(dst_path, "wb") as f:
-        f.write(encrypted)
+        f.write(payload)
 
 
 def unlock(src_path: str, dst_path: str, password: str) -> None:
@@ -1045,11 +1068,23 @@ def unlock(src_path: str, dst_path: str, password: str) -> None:
     if not os.path.exists(src_path):
         raise FileNotFoundError(f"Source file not found: {src_path}")
 
-    key = _derive_key(password)
-    fernet = Fernet(key)
-
     with open(src_path, "rb") as f:
-        encrypted = f.read()
+        payload = f.read()
+
+    if payload.startswith(LOCK_MAGIC):
+        offset = len(LOCK_MAGIC)
+        iterations = int.from_bytes(payload[offset : offset + 4], "big")
+        offset += 4
+        salt = payload[offset : offset + LOCK_SALT_BYTES]
+        encrypted = payload[offset + LOCK_SALT_BYTES :]
+        if iterations <= 0 or len(salt) != LOCK_SALT_BYTES or not encrypted:
+            raise InvalidToken
+        key = _derive_key(password, salt, iterations)
+    else:
+        encrypted = payload
+        key = _derive_legacy_key(password)
+
+    fernet = Fernet(key)
 
     decrypted = fernet.decrypt(encrypted)
 
@@ -1102,22 +1137,16 @@ class DuckMem:
         self._extensions = check_extensions(self.conn)
 
         # Initialize indexes
-        try:
+        with contextlib.suppress(duckdb.Error):
             init_fts_index(self.conn)
-        except duckdb.Error:
-            pass
 
         if self._extensions.get("vss"):
-            try:
+            with contextlib.suppress(duckdb.Error):
                 init_hnsw_index(self.conn)
-            except duckdb.Error:
-                pass
 
         if self._extensions.get("duckpgq"):
-            try:
+            with contextlib.suppress(duckdb.Error):
                 init_property_graph(self.conn)
-            except duckdb.Error:
-                pass
 
     def close(self) -> None:
         """Close the database connection."""
